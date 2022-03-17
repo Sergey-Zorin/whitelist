@@ -1,0 +1,81 @@
+#!/bin/bash
+
+WL_DIR=${WL_DIR:-/etc/nginx/whitelists}
+WL_LISTS=${1:-whitelist}
+
+WL_DEFAULT_TIMEOUT=$((86400*5)) # 5 days
+WL_TIMEOUT=${WL_TIMEOUT:-$WL_DEFAULT_TIMEOUT}
+
+WL_NAME=$( who -m --ips | awk '{print $1}' )
+WL_IPS=$( who -m --ips | awk '{print $5}' )
+WL_TYPE='login'
+
+WL_NOW=$( date +%s)
+WL_EXPIRE=$(( $WL_NOW + $WL_TIMEOUT ))
+WL_CLEAN=''
+WL_RELOAD=''
+
+if [ "$2" = "clean" ]; then
+  WL_CLEAN='yes'
+elif [ -n "$2" ]; then
+  WL_NAME=$2
+  WL_IPS=$( dig x +short $WL_NAME 2>/dev/null )
+  WL_TYPE='dns'
+  if [ -n "$3" ]; then
+    WL_EXPIRE='FOREVER'
+  fi
+fi
+
+
+if [ -z "$WL_CLEAN" ]; then
+
+  for list in $WL_LISTS; do
+
+    if [ ! -f ${WL_DIR}/${list}.list ]; then
+      echo -e "##### whitelist '$list'\n# allow <ip>; # <expire> <type> <name>\n" > ${WL_DIR}/${list}.list
+    fi
+
+
+    for ip in $WL_IPS; do
+      grep -e "^allow $ip " ${WL_DIR}/${list}.list >/dev/null 2>&1 || WL_RELOAD='yes'
+
+      cp -fp ${WL_DIR}/${list}.list ${WL_DIR}/${list}.list-bak;
+      awk -v ip=$ip -v expire=$WL_EXPIRE -v type=$WL_TYPE -v name=$WL_NAME \
+          'BEGIN { find=0 }
+          /^#/   { print; next }
+          $2 == ip && $5 == "FOREVER" { print; find=1; next }
+          $2 == ip { print "allow", ip, ";   #", expire, type, name; find=1; next }
+          { print }
+          END    { if(find==0) print "allow", ip, ";   #", expire, type, name }' \
+          ${WL_DIR}/${list}.list-bak > ${WL_DIR}/${list}.list
+      rm -r ${WL_DIR}/${list}.list-bak
+    done
+
+  done
+
+else
+
+  # cleaning lists
+  for list in $WL_LISTS; do
+    if [ -f ${WL_DIR}/${list}.list ]; then
+      cp -fp ${WL_DIR}/${list}.list ${WL_DIR}/${list}.list-bak;
+      # save comments and recent records
+      awk -v edge=$WL_NOW '/^#/ {print;next} $5 ~/^[0-9]+$/ && $5 > edge {print}' ${WL_DIR}/${list}.list-bak > ${WL_DIR}/${list}.list
+      # add FOREVER dna records
+      names=$( awk '/^#/ {next} $5 == "FOREVER" && $6 == "dns" { print $6 }' ${WL_DIR}/${list}.list-bak | sort -u)
+      for name in $names; do
+        ips=$( dig x +short $name 2>/dev/null )
+        for ip in $ips; do
+          echo "allow $ip ;   # FOREVER dns $name" >> ${WL_DIR}/${list}.list
+        done
+      done
+    fi
+  done
+
+  WL_RELOAD='yes'
+
+fi
+
+if [ -n "$WL_RELOAD" ]; then
+  sudo /usr/bin/systemctl reload nginx
+fi
